@@ -5,6 +5,7 @@ import time
 import random
 import os
 import requests
+import json
 from config import Config
 from google_drive import GoogleDriveManager
 
@@ -22,15 +23,60 @@ def get_working_user_agent():
     ]
     return random.choice(user_agents)
 
+TOKEN_FILE = os.path.join(os.getcwd(), 'token_youtube.json')
+
+def load_po_token():
+    """Charge visitorData et poToken depuis token_youtube.json"""
+    if not os.path.exists(TOKEN_FILE):
+        raise RuntimeError("token_youtube.json introuvable. Lancez renew_token.sh d'abord.")
+    with open(TOKEN_FILE, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    visitor_data = data.get('visitorData')
+    po_token = data.get('poToken') or data.get('po_token')
+    if not visitor_data or not po_token:
+        raise RuntimeError("token_youtube.json invalide (manque visitorData ou poToken)")
+    return visitor_data, po_token
+
 def create_youtube_with_headers(url):
-    """Crée un objet YouTube avec pytubefix"""
+    """Crée un objet YouTube en utilisant visitorData/poToken depuis token_youtube.json si présent.
+
+    Priorité: WEB + use_po_token=True avec visitor_data ; fallback: ANDROID.
+    """
+    last_error = None
+    # Tente d'utiliser token_youtube.json
     try:
-        # pytubefix gère mieux les headers et les restrictions
-        yt = YouTube(url)
+        visitor_data, po_token = load_po_token()
+        yt = YouTube(
+            url,
+            client="WEB",
+            use_po_token=True,
+            visitor_data=visitor_data,
+            use_oauth=False,
+            allow_oauth_cache=False,
+            on_progress_callback=lambda s, c, b: None
+        )
         return yt
     except Exception as e:
-        print(f"Erreur lors de la création de l'objet YouTube: {e}")
-        raise
+        last_error = e
+        print(f"Echec YouTube(client=WEB avec token_youtube.json): {e}")
+
+    # Fallback ANDROID sans po_token
+    try:
+        yt = YouTube(
+            url,
+            client="ANDROID",
+            use_po_token=False,
+            use_oauth=False,
+            allow_oauth_cache=False,
+            on_progress_callback=lambda s, c, b: None
+        )
+        return yt
+    except Exception as e:
+        last_error = e
+        print(f"Echec YouTube(client=ANDROID): {e}")
+
+    # Si tous les essais échouent, lever la dernière erreur
+    raise last_error if last_error else RuntimeError("Impossible de créer l'objet YouTube")
 
 def download_video(url, resolution, max_retries=None):
     if max_retries is None:
@@ -94,6 +140,7 @@ def download_video(url, resolution, max_retries=None):
                     if success:
                         return True, {
                             'message': f'Vidéo téléchargée et uploadée sur Google Drive avec succès: {filename}',
+                            'filename': filename,
                             'drive_info': result,
                             'resolution': resolution
                         }
@@ -107,7 +154,12 @@ def download_video(url, resolution, max_retries=None):
                     # Télécharger directement dans le dossier
                     stream.download(output_path=Config.DOWNLOAD_FOLDER, filename=filename)
                     
-                    return True, f"Video downloaded locally with resolution {resolution} as {filename}"
+                    return True, {
+                        'message': f'Video downloaded locally with resolution {resolution} as {filename}',
+                        'filename': filename,
+                        'resolution': resolution,
+                        'file_path': file_path
+                    }
             else:
                 return False, "No suitable video stream found."
                 
@@ -207,12 +259,17 @@ def download_by_resolution(resolution):
         if not is_valid_youtube_url(url):
             return jsonify({"error": "Invalid YouTube URL."}), 400
         
-        success, message = download_video(url, resolution)
+        success, result = download_video(url, resolution)
         
         if success:
-            return jsonify({"message": message}), 200
+            # Si result est un dictionnaire, l'utiliser directement
+            if isinstance(result, dict):
+                return jsonify(result), 200
+            # Si result est une string, l'encapsuler dans un dictionnaire
+            else:
+                return jsonify({"message": result}), 200
         else:
-            return jsonify({"error": message}), 500
+            return jsonify({"error": result}), 500
             
     except Exception as e:
         print(f"Unexpected error in download endpoint: {str(e)}")
@@ -254,6 +311,8 @@ def health_check():
             "download_folder": Config.DOWNLOAD_FOLDER,
             "debug_mode": Config.DEBUG,
             "library": "pytubefix 9.4.1",
+            "token_youtube_present": os.path.exists(TOKEN_FILE),
+            "token_youtube_mtime": (os.path.getmtime(TOKEN_FILE) if os.path.exists(TOKEN_FILE) else None),
             "google_drive": {
                 "enabled": Config.GOOGLE_DRIVE_ENABLED,
                 "folder_id": Config.GOOGLE_DRIVE_FOLDER_ID if Config.GOOGLE_DRIVE_FOLDER_ID else "Non configuré"
